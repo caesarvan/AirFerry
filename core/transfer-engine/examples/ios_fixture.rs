@@ -27,4 +27,47 @@ fn main() {
         }
         std::fs::write(format!("{directory}/{compression}.frames"), frames).unwrap();
     }
+    use sha2::{Digest, Sha256};
+    use transfer_engine::{SegmentMeta, SEGMENT_RAW_BYTES};
+    let large = vec![0xA5u8; 65 * 1024 * 1024];
+    std::fs::write(format!("{directory}/large.bin"), &large).unwrap();
+    for compression in 0..=2 {
+        let payload = compress::compress_with(&large, compression).unwrap();
+        let root = SessionId::derive("large-ios", large.len() as u64, compression as u64, &[]);
+        let count = (payload.len() as u64).div_ceil(SEGMENT_RAW_BYTES) as u32;
+        let mut frames = Vec::new();
+        // Reverse segment order exercises disk-backed out-of-order assembly.
+        for index in (0..count).rev() {
+            let start = index as usize * SEGMENT_RAW_BYTES as usize;
+            let chunk = &payload[start..payload.len().min(start + SEGMENT_RAW_BYTES as usize)];
+            let segment = SegmentMeta {
+                root_session_id: root.into(),
+                segment_index: index,
+                segment_count: count,
+                original_offset: start as u64,
+                root_original_size: payload.len() as u64,
+                root_sha256: Sha256::digest(&large).into(),
+                raw_sha256: Sha256::digest(chunk).into(),
+            };
+            let child = SessionId::derive_segment(root.into(), index);
+            let meta = FileMeta {
+                filename: "large.bin".into(),
+                original_size: large.len() as u64,
+                crc32: crc32fast::hash(&large),
+                compression,
+                compressed_size: chunk.len() as u64,
+                compressed_size_known: true,
+                crc32_known: true,
+            };
+            let mut sender =
+                SenderSession::new_segment(chunk, child, SenderConfig::default(), meta, segment)
+                    .unwrap();
+            for _ in 0..sender.total_k() * 12 / 10 + 64 {
+                let bytes = sender.next_frame().unwrap().to_bytes();
+                frames.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                frames.extend_from_slice(&bytes);
+            }
+        }
+        std::fs::write(format!("{directory}/large-{compression}.frames"), frames).unwrap();
+    }
 }

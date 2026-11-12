@@ -34,9 +34,12 @@ Xcode pre-build 自动使用 `build-rust.sh` 编译当前源码的静态库（`-
 4. 完成后 Rust 解压（Raw/Zstd/XZ），Swift 复核精确长度与已知 CRC32，再原子保存。
 5. 列表点击文件打开系统分享面板，可存储到“文件”或发送给其他 App。
 
-当前接收单会话文件，解压后上限 **64 MiB**；分段 descriptor-v5 会明确报错，
-不保存残段。多文件 ETBUNDL1 和 ETTEXTv1 容器目前作为原始容器文件保存，未实现解包 UI。
-不支持进程退出后的断点恢复、视频导入、发送或后台摄像头接收。
+支持 descriptor-v5 分段大文件，压缩流和原始文件上限均为 **256 MiB**（沿用共享 Rust 协议上限）。
+每次只保留一个分段解码器；段恢复后校验 SHA256 并原子写盘、同步及登记收据。
+全部段完成后以 1 MiB 缓冲拼接压缩流，调用 Rust 流式解压并验证长度、CRC32、整文件 SHA256。
+磁盘不足会报错并保留已完成段。分段暂存位于 Application Support/AirFerrySegments，
+重置和重启均保留；重新扫描同一文件描述帧后验证磁盘分段再续传。暂存目前不自动清理。多文件 ETBUNDL1 和 ETTEXTv1 容器目前作为原始容器文件保存，未实现解包 UI。
+未完成的当前段在进程退出后需重新接收；支持已完成分段的跨重启续传。不支持视频导入、发送或后台摄像头接收。
 接收文件保存在 Documents，每次接收单独 UUID 目录，不覆盖已有文件；过滤路径分隔符和控制字符。
 应用不发起网络请求；用户主动分享以及系统备份受用户系统设置控制。
 
@@ -52,7 +55,7 @@ bash apps/ios/test-integration.sh
 
 Swift 检查 V9/V10/V27/V40 长度位数、0x00–0xff 二进制、ECI、截断、非法模式及 CRC32 标准向量；另以 Core Image 生成 byte-mode 二维码，经 Vision 识别并验证二进制往返。
 AirFerry 发送端明确使用 byte-mode；不尝试将任意数字/字母二维码当作协议帧。
-`ios_fixture` 生成 Raw/Zstd/XZ 二进制流，Swift Integration 通过实际 C ABI 恢复并比较全部字节，验证长度、CRC 和路径隔离。
+`ios_fixture` 生成 Raw/Zstd/XZ 二进制流，Swift Integration 通过实际 C ABI 恢复并比较全部字节，验证长度、CRC 和路径隔离；另生成 65 MiB 的 Raw/Zstd/XZ 分段任务，测试乱序与模拟重启后续传、整文件 SHA256。
 CI 执行上述测试并编译未签名模拟器应用。真机验收仍需实际摄像头：权限拒绝/恢复、单码与四码、
 Raw/Zstd/XZ、丢帧循环、暂停/后台/恢复、重名接收、导出后比较 SHA256。
 模拟器无后置摄像头会显示清晰错误，不能用模拟器编译成功代替扫码验收。

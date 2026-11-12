@@ -11,6 +11,7 @@ final class Receiver {
     init(outputDirectory: URL? = nil) { self.outputDirectory = outputDirectory }
     private var handle: UnsafeMutableRawPointer?
     private var sessionID: Data?
+    private var segments: SegmentStore?
     private(set) var finished = false
     deinit { airferry_receiver_destroy(handle) }
 
@@ -20,6 +21,9 @@ final class Receiver {
               QRBytes.crc32(Data(bytes.dropLast(4))) == bytes.suffix(4).reduce(UInt32(0), { ($0 << 8) | UInt32($1) })
         else { return ("等待有效二维码", nil) }
         let id = Data(bytes[4..<20])
+        if id != sessionID, let old = handle, airferry_receiver_is_segmented(old) != 0, bytes[3] & 1 != 0 {
+            airferry_receiver_destroy(old); handle = nil
+        }
         if handle == nil {
             // Lock only to a descriptor; random/data-only QR cannot allocate a decoder.
             guard bytes[3] & 1 != 0 else { return ("等待文件描述帧，请循环播放", nil) }
@@ -31,12 +35,45 @@ final class Receiver {
         guard id == sessionID, let handle else { return ("正在接收其他文件；请重置后切换", nil) }
         let status = frame.withUnsafeBytes { airferry_receiver_ingest(handle, $0.bindMemory(to: UInt8.self).baseAddress, frame.count) }
         guard status >> 32 != UInt64(UInt32.max) else { return ("忽略损坏帧", nil) }
+        let nameSize = airferry_receiver_file_name(handle, nil, 0)
+        var nameBuffer = [UInt8](repeating: 0, count: max(1, nameSize))
+        _ = airferry_receiver_file_name(handle, &nameBuffer, nameBuffer.count)
+        let descriptorName = String(decoding: nameBuffer.prefix { $0 != 0 }, as: UTF8.self)
         if airferry_receiver_is_segmented(handle) != 0 {
-            throw ReceiveError.invalid("此版本暂不支持分段大文件，请在发送端拆成较小的单文件后发送。")
+            let metadata = SegmentStore.metadata(handle, name: descriptorName)
+            if let existing = segments, existing.meta != metadata {
+                throw ReceiveError.invalid("检测到不同大文件，请重置后切换；原有分段已保留。")
+            }
+            if segments == nil {
+                let base = try outputDirectory ?? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                segments = try SegmentStore(meta: metadata, directory: base.appendingPathComponent("AirFerrySegments"))
+            }
+            let store = segments!
+            let index = airferry_receiver_segment_index(handle)
+            if store.completed[index] == nil, status & 1 != 0 {
+                var pointer: UnsafeMutablePointer<UInt8>?
+                var count = 0
+                guard airferry_receiver_assemble_raw(handle, &pointer, &count) == 1, let pointer else {
+                    throw ReceiveError.invalid("分段恢复失败。")
+                }
+                defer { airferry_buffer_free(pointer, count) }
+                try store.store(index, data: Data(bytes: pointer, count: count), sha: SegmentStore.hash(handle, root: false))
+            }
+            if store.completed.count == Int(metadata.count) {
+                let url = try destination(descriptorName)
+                let partial = store.folder.appendingPathComponent("output.partial")
+                try store.finish(to: partial)
+                try FileManager.default.moveItem(at: partial, to: url)
+                finished = true
+                return ("大文件接收完成，SHA256 校验通过", url)
+            }
+            if store.completed[index] != nil {
+                airferry_receiver_destroy(handle); self.handle = nil; sessionID = nil
+            }
+            return ("大文件已保存 \(store.completed.count)/\(metadata.count) 段 · 当前段 \(index + 1)，符号 \(status >> 32)", nil)
         }
-        // Conservative mobile memory ceiling, checked before decompression.
-        guard airferry_receiver_file_size(handle) <= 64 * 1024 * 1024 else {
-            throw ReceiveError.invalid("原始文件超过 iOS 当前 64 MiB 限额。")
+        guard airferry_receiver_file_size(handle) <= SegmentStore.limit else {
+            throw ReceiveError.invalid("文件超过当前协议 256 MiB 限额。")
         }
         let received = status >> 32
         guard status & 1 != 0 else { return ("已接收 \(received) 个符号 · 请保持对准", nil) }
@@ -50,20 +87,18 @@ final class Receiver {
         guard UInt64(count) == airferry_receiver_file_size(handle),
               airferry_receiver_crc32_known(handle) == 0 || UInt64(QRBytes.crc32(data)) == airferry_receiver_crc32(handle)
         else { throw ReceiveError.invalid("文件长度或 CRC32 校验失败，未保存文件。") }
-        let size = airferry_receiver_file_name(handle, nil, 0)
-        var nameBytes = [UInt8](repeating: 0, count: max(1, size))
-        _ = airferry_receiver_file_name(handle, &nameBytes, nameBytes.count)
-        let name = String(decoding: nameBytes.prefix { $0 != 0 }, as: UTF8.self)
+        let url = try destination(descriptorName)
+        try data.write(to: url, options: .atomic)
+        finished = true
+        return ("接收完成，校验通过", url)
+    }
+    private func destination(_ name: String) throws -> URL {
         let safe = name.components(separatedBy: CharacterSet(charactersIn: "/\\:").union(.controlCharacters)).joined(separator: "_")
         let directory = try outputDirectory ?? FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        // Each reception has a unique directory; received names can never overwrite another file.
         let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var shortName = String(safe.prefix(180))
         while shortName.utf8.count > 180 { shortName.removeLast() }
-        let url = folder.appendingPathComponent(shortName.isEmpty || shortName == "." || shortName == ".." ? "received.bin" : shortName)
-        try data.write(to: url, options: .atomic)
-        finished = true
-        return ("接收完成，校验通过", url)
+        return folder.appendingPathComponent(shortName.isEmpty || shortName == "." || shortName == ".." ? "received.bin" : shortName)
     }
 }

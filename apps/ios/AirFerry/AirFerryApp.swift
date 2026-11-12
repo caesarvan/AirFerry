@@ -24,7 +24,7 @@ struct ReceiveView: View {
                         Button("重置") { camera.stop(reset: true) }.buttonStyle(.bordered)
                     }
                 } header: { Text("离线接收") } footer: {
-                    Text("在电脑上播放 AirFerry 二维码视频，将后置摄像头对准屏幕。暂停后可继续；切换文件请重置。当前支持单会话文件，原始文件限 64 MiB，暂不支持分段传输。")
+                    Text("在电脑上播放 AirFerry 二维码视频，将后置摄像头对准屏幕。暂停后可继续；切换文件请重置。支持最大 256 MiB 文件及分段接收；已完成分段自动暂存，重启后扫描同一文件可继续。")
                 }
                 Section("已接收文件（\(camera.files.count)）") {
                     if camera.files.isEmpty { Text("接收完成的文件会保存在这里").foregroundStyle(.secondary) }
